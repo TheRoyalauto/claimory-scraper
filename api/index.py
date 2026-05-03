@@ -45,7 +45,10 @@ def score_shop(shop: dict) -> int:
 
 
 @app.get("/api/scrape")
-async def scrape_shops(zip_code: str = Query(..., description="US ZIP code to search")):
+async def scrape_shops(
+    zip_code: str = Query(..., description="US ZIP code to search"),
+    debug: bool = Query(False, description="Return raw page info for diagnostics"),
+):
     try:
         from scrapling.fetchers import StealthyFetcher
 
@@ -58,11 +61,29 @@ async def scrape_shops(zip_code: str = Query(..., description="US ZIP code to se
             timeout=45000,
         )
 
+        if debug:
+            # Diagnostic: report what the page actually returned
+            body_text = (page.css_first("body").text or "")[:500] if page.css_first("body") else ""
+            return JSONResponse({
+                "zip_code": zip_code,
+                "page_title": page.css_first("title").text if page.css_first("title") else "",
+                "url_after_load": str(getattr(page, "url", "unknown")),
+                "result_card_count_v1": len(page.css('div[jsaction*="pane.place"]')),
+                "result_card_count_v2": len(page.css('div[class*="Nv2PK"]')),
+                "result_card_count_v3": len(page.css('a[href*="/maps/place/"]')),
+                "body_text_preview": body_text,
+                "html_length": len(page.body) if hasattr(page, "body") else 0,
+            })
+
         shops = []
         seen = set()
 
-        # Google Maps result cards
-        results = page.css('div[jsaction*="pane.place"]') or page.css('div[class*="Nv2PK"]')
+        # Google Maps result cards (try multiple selector variants)
+        results = (
+            page.css('a[href*="/maps/place/"]')
+            or page.css('div[jsaction*="pane.place"]')
+            or page.css('div[class*="Nv2PK"]')
+        )
 
         for el in results[:25]:
             try:
