@@ -403,13 +403,25 @@ async def scrape_shops(
     shops: list[dict[str, Any]] = []
     seen: set[str] = set()
     parse_errors: list[str] = []
-    for card in cards[:60]:
+    rejected = {"no_name": 0, "dup_name": 0, "no_keyword": 0}
+    for idx, card in enumerate(cards[:60]):
         try:
+            anchor = card_first_anchor(card)
+            name = (anchor.attrib.get("aria-label") or "").strip() if anchor is not None else ""
+            if not name or len(name) < 3:
+                rejected["no_name"] += 1
+                continue
+            if name in seen:
+                rejected["dup_name"] += 1
+                continue
+            if not any(kw in name.lower() for kw in KEYWORDS):
+                rejected["no_keyword"] += 1
+                continue
             shop = parse_card(card, zip_code, seen)
             if shop is not None:
                 shops.append(shop)
         except Exception as ex:
-            parse_errors.append(f"{type(ex).__name__}: {ex}")
+            parse_errors.append(f"card[{idx}] {type(ex).__name__}: {ex}")
 
     shops.sort(key=lambda x: x["score"], reverse=True)
     if shops:
@@ -422,6 +434,7 @@ async def scrape_shops(
         "elapsed_ms": int((time.time() - started) * 1000),
         "cached": False,
     }
+    payload["rejected"] = rejected
     if parse_errors:
-        payload["parse_errors"] = parse_errors[:5]
+        payload["parse_errors"] = parse_errors[:8]
     return JSONResponse(payload)
