@@ -134,7 +134,8 @@ _ADDRESS_BETWEEN_RE = re.compile(
     re.IGNORECASE,
 )
 _STATE_FROM_ADDR_RE = re.compile(r",\s*([A-Z]{2})\s*\d{5}")
-_LEADING_DOT_RE = re.compile(r"^[·\s]+")
+_LEADING_DOT_RE = re.compile(r"^[\s·•‧⋅· •‧]+")
+_ARIA_REVIEW_COUNT_RE = re.compile(r"^\s*\(?(\d{1,3}(?:[,\d]{0,7}))\)?\s*$")
 
 
 def state_from_zip(zip_code: str) -> str:
@@ -161,26 +162,39 @@ def extract_rating_reviews(card, body: str) -> tuple[float, int]:
 
     reviews = 0
     if hasattr(card, "css"):
-        candidates = (
-            card.css("[role='img'][aria-label]")
-            + card.css("span[aria-label]")
-            + card.css("button[aria-label]")
-            + card.css("a[aria-label]")
-        )
-        for el in candidates:
-            label = el.attrib.get("aria-label") or ""
-            if "review" not in label.lower():
-                continue
-            m2 = _REVIEWS_ARIA_RE.search(label)
-            if not m2:
-                continue
+        seen_labels: list[str] = []
+        for el in card.css("[aria-label]"):
             try:
-                if rating == 0.0 and m2.group(1):
-                    rating = float(m2.group(1))
-                reviews = int(m2.group(2).replace(",", ""))
-                break
-            except ValueError:
+                label = el.attrib.get("aria-label") or ""
+            except Exception:
                 continue
+            if not label:
+                continue
+            seen_labels.append(label)
+            # Format A: "4.8 stars 323 Reviews"
+            m2 = _REVIEWS_ARIA_RE.search(label)
+            if m2:
+                try:
+                    if rating == 0.0 and m2.group(1):
+                        rating = float(m2.group(1))
+                    reviews = int(m2.group(2).replace(",", ""))
+                    return rating, reviews
+                except ValueError:
+                    pass
+        # Format B: a span with aria-label like "(323)" — bare review-count parens.
+        for label in seen_labels:
+            m3 = _ARIA_REVIEW_COUNT_RE.match(label)
+            if m3:
+                try:
+                    n = int(m3.group(1).replace(",", ""))
+                    # Filter implausible values (phone area codes are 3 digits, but
+                    # actual review counts can be 3+ digits too — the parens-only
+                    # pattern is the most reliable disambiguator).
+                    if 1 <= n <= 999_999:
+                        reviews = n
+                        return rating, reviews
+                except ValueError:
+                    continue
     return rating, reviews
 
 
@@ -388,10 +402,20 @@ async def scrape_shops(
         sample = []
         for i, card in enumerate(cards[:8]):
             anchor = card_first_anchor(card)
+            labels = []
+            if hasattr(card, "css"):
+                for el in card.css("[aria-label]"):
+                    try:
+                        v = el.attrib.get("aria-label") or ""
+                        if v:
+                            labels.append(v)
+                    except Exception:
+                        pass
             sample.append({
                 "i": i,
                 "aria_label": anchor.attrib.get("aria-label", "") if anchor else "",
                 "joined_text": card_full_text(card)[:300],
+                "all_aria_labels": labels[:15],
             })
         return JSONResponse({
             "zip_code": zip_code,
