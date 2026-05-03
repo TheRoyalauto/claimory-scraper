@@ -78,58 +78,81 @@ async def scrape_shops(
 
         shops = []
         seen = set()
+        errors: list[str] = []
 
-        # Google Maps result cards (try multiple selector variants)
-        results = (
-            page.css('a[href*="/maps/place/"]')
-            or page.css('div[jsaction*="pane.place"]')
-            or page.css('div[class*="Nv2PK"]')
-        )
+        # Google Maps wraps each result in an `<a href="/maps/place/...">` link.
+        # The shop name lives in the link's aria-label; rating/reviews/address
+        # are in sibling elements within the same Nv2PK card.
+        # Strategy: find each Nv2PK card, then extract from anchor + text content.
+        cards = page.css('div[class*="Nv2PK"]') or page.css('a[href*="/maps/place/"]')
 
-        for el in results[:25]:
+        for card in cards[:30]:
             try:
+                # Name from aria-label of the place anchor
+                anchor = card.css_first('a[href*="/maps/place/"]') if hasattr(card, "css_first") else None
+                if not anchor:
+                    anchor_list = card.css('a[href*="/maps/place/"]')
+                    anchor = anchor_list[0] if anchor_list else None
                 name = ""
-                for sel in ['div[class*="fontHeadlineSmall"]', 'h3', 'div[class*="qBF1Pd"]']:
-                    name_el = el.css_first(sel)
-                    if name_el:
-                        name = name_el.text.strip()
-                        break
+                if anchor is not None:
+                    name = (anchor.attrib.get("aria-label", "") or "").strip()
+                if not name:
+                    # Fall back: any heading text
+                    headings = card.css('div[class*="qBF1Pd"]') or card.css('div[class*="fontHeadlineSmall"]')
+                    if headings:
+                        name = (headings[0].text or "").strip()
 
                 if not name or len(name) < 3 or name in seen:
                     continue
 
-                is_collision = any(kw in name.lower() for kw in KEYWORDS)
-                if not is_collision:
+                if not any(kw in name.lower() for kw in KEYWORDS):
                     continue
 
                 seen.add(name)
 
+                # Full visible text of the card — easier to regex than fight selectors
+                card_text = card.text or ""
+
+                # Rating + reviews like "4.7(123)" or "4.7 stars 123 reviews"
                 rating, reviews = 0.0, 0
-                rating_el = el.css_first('span[aria-label*="stars"]') or el.css_first('span[class*="MW4etd"]')
-                if rating_el:
-                    aria = rating_el.attrib.get("aria-label", "") or rating_el.text or ""
-                    m = re.search(r"([\d.]+)", aria)
-                    if m:
-                        rating = float(m.group(1))
+                rating_match = re.search(r"(\d\.\d)", card_text)
+                if rating_match:
+                    try:
+                        rating = float(rating_match.group(1))
+                    except ValueError:
+                        pass
+                reviews_match = re.search(r"\((\d{1,3}(?:[,\d]*))\)", card_text)
+                if reviews_match:
+                    try:
+                        reviews = int(reviews_match.group(1).replace(",", ""))
+                    except ValueError:
+                        pass
 
-                reviews_el = el.css_first('span[aria-label*="reviews"]') or el.css_first('span[class*="UY7F9"]')
-                if reviews_el:
-                    aria = reviews_el.attrib.get("aria-label", "") or reviews_el.text or ""
-                    m = re.search(r"[\d,]+", aria)
-                    if m:
-                        reviews = int(m.group().replace(",", ""))
-
+                # Address: any span that ends in "<state> <zip>"
                 address = ""
-                for sel in ['div[class*="W4Efsd"]:last-child', 'div[class*="fontBodyMedium"]']:
-                    addr_el = el.css_first(sel)
-                    if addr_el:
-                        address = addr_el.text.strip()
-                        break
+                addr_match = re.search(r"([\w\s.,#'-]+,\s*[A-Z]{2}\s*\d{5})", card_text)
+                if addr_match:
+                    address = addr_match.group(1).strip()
 
                 state = ""
-                m = re.search(r",\s*([A-Z]{2})\s+\d{5}", address)
-                if m:
-                    state = m.group(1)
+                state_match = re.search(r",\s*([A-Z]{2})\s*\d{5}", address or card_text)
+                if state_match:
+                    state = state_match.group(1)
+
+                # Phone: US-style 555-555-5555 or (555) 555-5555
+                phone = ""
+                phone_match = re.search(r"\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}", card_text)
+                if phone_match:
+                    phone = phone_match.group(0)
+
+                # Website: look for any non-Google a[href] inside the card
+                website = ""
+                if hasattr(card, "css"):
+                    for link in card.css('a[href^="http"]'):
+                        href = link.attrib.get("href", "")
+                        if href and "google.com" not in href and "/maps/" not in href:
+                            website = href
+                            break
 
                 shop = {
                     "name": name,
@@ -138,19 +161,23 @@ async def scrape_shops(
                     "state": state,
                     "rating": rating,
                     "reviews": reviews,
-                    "phone": "",
-                    "website": "",
+                    "phone": phone,
+                    "website": website,
                 }
                 shop["score"] = score_shop(shop)
 
-                if shop["score"] >= 4:
+                if shop["score"] >= 3:  # tier-warm threshold
                     shops.append(shop)
 
-            except Exception:
+            except Exception as ex:
+                errors.append(f"{type(ex).__name__}: {ex}")
                 continue
 
         shops.sort(key=lambda x: x["score"], reverse=True)
-        return JSONResponse({"zip_code": zip_code, "count": len(shops), "shops": shops[:15]})
+        payload = {"zip_code": zip_code, "count": len(shops), "shops": shops[:15]}
+        if errors:
+            payload["parse_errors"] = errors[:5]
+        return JSONResponse(payload)
 
     except ImportError:
         return JSONResponse(
