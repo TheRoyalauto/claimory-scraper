@@ -134,7 +134,8 @@ _ADDRESS_BETWEEN_RE = re.compile(
     re.IGNORECASE,
 )
 _STATE_FROM_ADDR_RE = re.compile(r",\s*([A-Z]{2})\s*\d{5}")
-_LEADING_DOT_RE = re.compile(r"^[\s·•‧⋅· •‧]+")
+_LEADING_NOISE_RE = re.compile(r"^[\u00B7\u00A0\u2022\u2027\u22C5\uE000-\uF8FF\s\-]+")
+_TRAILING_NOISE_RE = re.compile(r"[\u00B7\u00A0\u2022\u2027\u22C5\uE000-\uF8FF\s\-]+$")
 _ARIA_REVIEW_COUNT_RE = re.compile(r"^\s*\(?(\d{1,3}(?:[,\d]{0,7}))\)?\s*$")
 
 
@@ -288,7 +289,10 @@ def parse_card(card, zip_code: str, seen: set[str]) -> dict[str, Any] | None:
     addr_m = _ADDRESS_BETWEEN_RE.search(body)
     if addr_m:
         # Strip every Unicode dot-bullet variant + whitespace from both ends.
-        address = addr_m.group(1).strip(" \t ·•‧⋅·•‧⋅")
+        raw = addr_m.group(1)
+        raw = _LEADING_NOISE_RE.sub("", raw)
+        raw = _TRAILING_NOISE_RE.sub("", raw)
+        address = raw
 
     state_m = _STATE_FROM_ADDR_RE.search(address or body)
     state = state_m.group(1) if state_m else state_from_zip(zip_code)
