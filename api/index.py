@@ -412,11 +412,16 @@ async def scrape_shops(
                             labels.append(v)
                     except Exception:
                         pass
+            body = card_full_text(card)
+            addr_m = _ADDRESS_BETWEEN_RE.search(body)
+            raw = addr_m.group(1) if addr_m else ""
             sample.append({
                 "i": i,
                 "aria_label": anchor.attrib.get("aria-label", "") if anchor else "",
-                "joined_text": card_full_text(card)[:300],
+                "joined_text": body[:300],
                 "all_aria_labels": labels[:15],
+                "raw_addr": raw,
+                "raw_addr_codepoints": [hex(ord(c)) for c in raw[:8]],
             })
         return JSONResponse({
             "zip_code": zip_code,
