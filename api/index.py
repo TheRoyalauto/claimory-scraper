@@ -62,17 +62,18 @@ async def scrape_shops(
         )
 
         if debug:
-            # Diagnostic: report what the page actually returned
-            body_text = (page.css_first("body").text or "")[:500] if page.css_first("body") else ""
+            html = page.body if hasattr(page, "body") else (page.html_content if hasattr(page, "html_content") else "")
+            html_str = html.decode("utf-8", errors="ignore") if isinstance(html, bytes) else str(html)
+            titles = page.css('title')
             return JSONResponse({
                 "zip_code": zip_code,
-                "page_title": page.css_first("title").text if page.css_first("title") else "",
-                "url_after_load": str(getattr(page, "url", "unknown")),
-                "result_card_count_v1": len(page.css('div[jsaction*="pane.place"]')),
-                "result_card_count_v2": len(page.css('div[class*="Nv2PK"]')),
-                "result_card_count_v3": len(page.css('a[href*="/maps/place/"]')),
-                "body_text_preview": body_text,
-                "html_length": len(page.body) if hasattr(page, "body") else 0,
+                "page_title": titles[0].text if titles else "",
+                "result_card_count_pane_place": len(page.css('div[jsaction*="pane.place"]')),
+                "result_card_count_nv2pk": len(page.css('div[class*="Nv2PK"]')),
+                "result_card_count_place_link": len(page.css('a[href*="/maps/place/"]')),
+                "html_length": len(html_str),
+                "html_preview_first_2000": html_str[:2000],
+                "html_preview_middle_1000": html_str[len(html_str)//2:len(html_str)//2+1000] if html_str else "",
             })
 
         shops = []
