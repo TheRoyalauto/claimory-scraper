@@ -67,16 +67,16 @@ async def scrape_shops(
             for i, card in enumerate(cards[:5]):
                 anchor_list = card.css('a[href*="/maps/place/"]') if hasattr(card, "css") else []
                 aria = anchor_list[0].attrib.get("aria-label", "") if anchor_list else ""
-                sample.append({
-                    "i": i,
-                    "aria_label": aria,
-                    "text_first_300": (card.text or "")[:300] if hasattr(card, "text") else "",
-                })
-            return JSONResponse({
-                "zip_code": zip_code,
-                "card_count": len(cards),
-                "samples": sample,
-            })
+                joined = ""
+                if hasattr(card, "css"):
+                    parts = []
+                    for child in card.css("span") + card.css("div"):
+                        t = (child.text or "").strip()
+                        if t:
+                            parts.append(t)
+                    joined = " ".join(parts)[:600]
+                sample.append({"i": i, "aria_label": aria, "joined_text": joined})
+            return JSONResponse({"zip_code": zip_code, "card_count": len(cards), "samples": sample})
 
         shops = []
         seen = set()
@@ -112,8 +112,15 @@ async def scrape_shops(
 
                 seen.add(name)
 
-                # Full visible text of the card — easier to regex than fight selectors
-                card_text = card.text or ""
+                # Scrapling Element.text returns only the immediate text node, so build
+                # the full visible text by walking every span/div child and joining them.
+                text_parts: list[str] = []
+                if hasattr(card, "css"):
+                    for child in card.css("span") + card.css("div"):
+                        t = (child.text or "").strip()
+                        if t:
+                            text_parts.append(t)
+                card_text = " ".join(text_parts)
 
                 # Rating + reviews like "4.7(123)" or "4.7 stars 123 reviews"
                 rating, reviews = 0.0, 0
@@ -168,8 +175,9 @@ async def scrape_shops(
                 }
                 shop["score"] = score_shop(shop)
 
-                if shop["score"] >= 3:  # tier-warm threshold
-                    shops.append(shop)
+                # No threshold filter here — n8n's Score Lead step does the filtering.
+                # The scraper's job is to surface every collision-related shop it finds.
+                shops.append(shop)
 
             except Exception as ex:
                 errors.append(f"{type(ex).__name__}: {ex}")
