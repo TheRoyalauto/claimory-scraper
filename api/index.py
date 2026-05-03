@@ -185,33 +185,40 @@ async def scrape_shops(
                             text_parts.append(t)
                 card_text = " ".join(text_parts)
 
-                # Rating + reviews come from the rating span's aria-label,
-                # e.g. "4.8 stars 323 Reviews" — far more reliable than regex on text.
+                # Rating from the leading "<digit>.<digit>" in card text.
+                # Reviews are shown right after as either "4.8(323)" or "4.8 (323)".
+                # We must be careful: phone numbers contain "(323)" too — restrict to the
+                # parenthesized integer that immediately follows the rating.
                 rating, reviews = 0.0, 0
-                rating_aria = ""
-                if hasattr(card, "css"):
-                    for s in card.css('span[role="img"]') + card.css('span[aria-label*="star"]'):
-                        a = s.attrib.get("aria-label", "")
-                        if a:
-                            rating_aria = a
-                            break
-                if rating_aria:
-                    m = re.search(r"(\d\.\d)\s*stars?\s*([\d,]+)\s*review", rating_aria, re.IGNORECASE)
-                    if m:
-                        try:
-                            rating = float(m.group(1))
-                            reviews = int(m.group(2).replace(",", ""))
-                        except ValueError:
-                            pass
-
-                # Fallback: bare leading rating in text if aria-label missing.
-                if rating == 0.0:
+                m = re.match(r"^\s*(\d\.\d)\s*\(([\d,]+)\)", card_text)
+                if m:
+                    try:
+                        rating = float(m.group(1))
+                        reviews = int(m.group(2).replace(",", ""))
+                    except ValueError:
+                        pass
+                else:
+                    # Bare rating without review-count parens.
                     m = re.match(r"^\s*(\d\.\d)", card_text)
                     if m:
                         try:
                             rating = float(m.group(1))
                         except ValueError:
                             pass
+
+                # Fallback: walk every aria-label looking for "X stars Y reviews" format.
+                if reviews == 0 and hasattr(card, "css"):
+                    for s in card.css("span") + card.css("button"):
+                        a = s.attrib.get("aria-label", "")
+                        rev_m = re.search(r"(\d\.\d)\s*stars?\s*([\d,]+)\s*review", a, re.IGNORECASE)
+                        if rev_m:
+                            try:
+                                if rating == 0.0:
+                                    rating = float(rev_m.group(1))
+                                reviews = int(rev_m.group(2).replace(",", ""))
+                            except ValueError:
+                                pass
+                            break
 
                 # Phone: only match a real US format with separator (skips area-code-only "(323)")
                 phone = ""
@@ -228,7 +235,7 @@ async def scrape_shops(
                     re.IGNORECASE,
                 )
                 if addr_match:
-                    address = addr_match.group(1).strip()
+                    address = addr_match.group(1).strip().lstrip("·").strip()
 
                 # State: try parsing from address; fallback to ZIP→state via known prefix table.
                 state = ""
