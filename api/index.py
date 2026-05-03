@@ -130,7 +130,7 @@ _REVIEWS_ARIA_RE = re.compile(
 )
 _PHONE_RE = re.compile(r"\(\d{3}\)\s?\d{3}[-.\s]?\d{4}|\b\d{3}[-.\s]\d{3}[-.\s]\d{4}\b")
 _ADDRESS_BETWEEN_RE = re.compile(
-    r"(?:auto repair shop|auto body shop|body shop|collision (?:repair|center)|paint and body)\s*·?\s*·?\s*(.+?)\s+(?:Closed|Open|Opens|Closes)",
+    r"(?:auto repair shop|auto body shop|body shop|collision (?:repair|center)|paint and body)[\s·•‧⋅·•‧]*(.+?)\s+(?:Closed|Open|Opens|Closes)",
     re.IGNORECASE,
 )
 _STATE_FROM_ADDR_RE = re.compile(r",\s*([A-Z]{2})\s*\d{5}")
@@ -287,7 +287,8 @@ def parse_card(card, zip_code: str, seen: set[str]) -> dict[str, Any] | None:
     address = ""
     addr_m = _ADDRESS_BETWEEN_RE.search(body)
     if addr_m:
-        address = _LEADING_DOT_RE.sub("", addr_m.group(1).strip())
+        # Strip every Unicode dot-bullet variant + whitespace from both ends.
+        address = addr_m.group(1).strip(" \t ·•‧⋅·•‧⋅")
 
     state_m = _STATE_FROM_ADDR_RE.search(address or body)
     state = state_m.group(1) if state_m else state_from_zip(zip_code)
