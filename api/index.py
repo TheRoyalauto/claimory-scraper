@@ -1,11 +1,42 @@
+"""
+Claimory Scrapling lead-gen API.
+
+Scrapes Google Maps for collision-repair shops near a US ZIP code and returns
+structured shop records (name, address, state, rating, reviews, phone, website,
+score). Built on Scrapling's StealthyFetcher (Camoufox under the hood) to
+bypass Google's bot detection without paying for a third-party scraping API.
+
+Performance notes:
+- We avoid `network_idle=True` because Google Maps long-polls and never goes
+  idle — that single flag was costing ~40s per request. We instead wait for
+  the first result card to appear (`wait_selector`).
+- `disable_resources=True` skips fonts, images, and most CSS. Page weight
+  drops from ~5MB to ~600KB and load time from ~8s to ~2s.
+- A `page_action` callback scrolls the results panel three times so we get
+  30-60 cards instead of the initial 12.
+- Successful scrapes are cached in memory for 6 hours, keyed by ZIP. Repeat
+  calls inside the TTL return instantly. Cache clears on container restart.
+"""
+
 import re
-import asyncio
+import time
+from typing import Any
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 
 app = FastAPI()
 
+
+# ---------------------------------------------------------------------------
+# Static data
+# ---------------------------------------------------------------------------
+
 PRIORITY_STATES = {"TX", "FL", "CA", "OH", "PA", "NY", "GA", "NC", "MI", "IL"}
+
+KEYWORDS = (
+    "collision repair", "collision shop", "body shop", "auto body",
+    "collision center", "paint and body",
+)
 
 # Coarse ZIP-prefix to state lookup (covers the workflow's seeded ZIPs).
 _ZIP_PREFIX_STATE = {
@@ -65,24 +96,116 @@ _ZIP_PREFIX_STATE = {
 }
 
 
-def _state_from_zip(zip_code: str) -> str:
+# ---------------------------------------------------------------------------
+# In-memory cache (clears on container restart)
+# ---------------------------------------------------------------------------
+
+_CACHE_TTL_SECONDS = 6 * 3600
+_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+
+
+def _cache_get(zip_code: str) -> list[dict[str, Any]] | None:
+    entry = _cache.get(zip_code)
+    if not entry:
+        return None
+    inserted_at, shops = entry
+    if (time.time() - inserted_at) > _CACHE_TTL_SECONDS:
+        _cache.pop(zip_code, None)
+        return None
+    return shops
+
+
+def _cache_put(zip_code: str, shops: list[dict[str, Any]]) -> None:
+    _cache[zip_code] = (time.time(), shops)
+
+
+# ---------------------------------------------------------------------------
+# Pure parsing helpers
+# ---------------------------------------------------------------------------
+
+_ANCHOR_ARIA_RE = re.compile(
+    r"^\s*(?P<name>.+?)(?:,\s*(?P<rating>\d\.\d)\s*stars?\s*(?P<reviews>[\d,]+)\s*Reviews?)?(?:,\s*(?P<category>[^,]+))?\s*$",
+    re.IGNORECASE,
+)
+_PHONE_RE = re.compile(r"\(\d{3}\)\s?\d{3}[-.\s]?\d{4}|\b\d{3}[-.\s]\d{3}[-.\s]\d{4}\b")
+_ADDRESS_BETWEEN_RE = re.compile(
+    r"(?:body shop|collision (?:repair|center)|paint and body)\s*·\s*·?\s*(.+?)\s+(?:Closed|Open|Opens|Closes)",
+    re.IGNORECASE,
+)
+_STATE_FROM_ADDR_RE = re.compile(r",\s*([A-Z]{2})\s*\d{5}")
+
+
+def state_from_zip(zip_code: str) -> str:
     if not zip_code or len(zip_code) < 3:
         return ""
     return _ZIP_PREFIX_STATE.get(zip_code[:3], "")
 
 
-KEYWORDS = [
-    "collision repair", "collision shop", "body shop", "auto body",
-    "collision center", "paint and body"
-]
+def parse_anchor_aria(label: str) -> tuple[str, float, int]:
+    """
+    Google encodes results as `"<Name>, <rating> stars <reviews> Reviews, <Category>"`.
+    Returns (name, rating, reviews). Missing fields default to ("", 0.0, 0).
+    """
+    m = _ANCHOR_ARIA_RE.match(label or "")
+    if not m:
+        return label.strip(), 0.0, 0
+    name = (m.group("name") or "").strip()
+    rating = 0.0
+    reviews = 0
+    if m.group("rating"):
+        try:
+            rating = float(m.group("rating"))
+        except ValueError:
+            pass
+    if m.group("reviews"):
+        try:
+            reviews = int(m.group("reviews").replace(",", ""))
+        except ValueError:
+            pass
+    return name, rating, reviews
 
 
-def score_shop(shop: dict) -> int:
+def card_full_text(card) -> str:
+    """Concatenate every span/div text node in a card. Scrapling's `.text` is shallow."""
+    if not hasattr(card, "css"):
+        return ""
+    parts: list[str] = []
+    for child in card.css("span") + card.css("div"):
+        t = (child.text or "").strip()
+        if t:
+            parts.append(t)
+    return " ".join(parts)
+
+
+def card_first_anchor(card):
+    """Find the first `<a href="/maps/place/...">` inside a card, or None."""
+    if hasattr(card, "css_first"):
+        a = card.css_first('a[href*="/maps/place/"]')
+        if a is not None:
+            return a
+    if hasattr(card, "css"):
+        anchors = card.css('a[href*="/maps/place/"]')
+        if anchors:
+            return anchors[0]
+    return None
+
+
+def card_external_website(card) -> str:
+    """Return the first non-Google http link inside the card, or empty string."""
+    if not hasattr(card, "css"):
+        return ""
+    for link in card.css('a[href^="http"]'):
+        href = link.attrib.get("href", "") or ""
+        if href and "google.com" not in href and "/maps/" not in href:
+            return href
+    return ""
+
+
+def score_shop(shop: dict[str, Any]) -> int:
     score = 0
     reviews = shop.get("reviews", 0) or 0
-    rating = shop.get("rating", 0) or 0
+    rating = shop.get("rating", 0) or 0.0
     state = shop.get("state", "")
-
     if reviews >= 100:
         score += 4
     elif reviews >= 50:
@@ -91,204 +214,190 @@ def score_shop(shop: dict) -> int:
         score += 2
     elif reviews >= 5:
         score += 1
-
     if rating >= 4.5:
         score += 2
     elif rating >= 4.0:
         score += 1
-
     if state in PRIORITY_STATES:
         score += 2
-
     if shop.get("website"):
         score += 1
     if shop.get("phone"):
         score += 1
-
     return min(score, 10)
+
+
+def parse_card(card, zip_code: str, seen: set[str]) -> dict[str, Any] | None:
+    """Extract a structured shop record from one Google Maps card. None = skip."""
+    anchor = card_first_anchor(card)
+    aria_label = ""
+    if anchor is not None:
+        aria_label = (anchor.attrib.get("aria-label") or "").strip()
+    name, rating, reviews = parse_anchor_aria(aria_label)
+
+    if not name or len(name) < 3 or name in seen:
+        return None
+    if not any(kw in name.lower() for kw in KEYWORDS):
+        return None
+    seen.add(name)
+
+    body = card_full_text(card)
+
+    phone_m = _PHONE_RE.search(body)
+    phone = phone_m.group(0).strip() if phone_m else ""
+
+    address = ""
+    addr_m = _ADDRESS_BETWEEN_RE.search(body)
+    if addr_m:
+        address = addr_m.group(1).strip().lstrip("·").strip()
+
+    state_m = _STATE_FROM_ADDR_RE.search(address or body)
+    state = state_m.group(1) if state_m else state_from_zip(zip_code)
+
+    website = card_external_website(card)
+
+    shop = {
+        "name": name,
+        "address": address,
+        "zip_code": zip_code,
+        "state": state,
+        "rating": rating,
+        "reviews": reviews,
+        "phone": phone,
+        "website": website,
+    }
+    shop["score"] = score_shop(shop)
+    return shop
+
+
+# ---------------------------------------------------------------------------
+# Browser interaction (Playwright via Scrapling)
+# ---------------------------------------------------------------------------
+
+async def scroll_results_panel(page) -> None:
+    """
+    Run inside Scrapling's `page_action` callback. Scrolls the Google Maps
+    results panel three times to trigger lazy-loading of additional cards.
+    """
+    js = """
+    (async () => {
+      const panel = document.querySelector('div[role="feed"]')
+        || document.querySelector('div[aria-label*="Results"]');
+      if (!panel) return false;
+      for (let i = 0; i < 3; i++) {
+        panel.scrollBy(0, panel.clientHeight);
+        await new Promise(r => setTimeout(r, 700));
+      }
+      return true;
+    })()
+    """
+    try:
+        await page.evaluate(js)
+    except Exception:
+        pass
+
+
+async def fetch_maps_page(url: str):
+    """
+    Fetch the Google Maps results page using Scrapling's stealth fetcher.
+    Returns the parsed Response object, or raises if the fetcher itself fails.
+    """
+    from scrapling.fetchers import StealthyFetcher
+
+    return await StealthyFetcher.async_fetch(
+        url,
+        headless=True,
+        network_idle=False,
+        timeout=30000,
+        wait_selector='div[class*="Nv2PK"], a[href*="/maps/place/"]',
+        wait_selector_state="attached",
+        disable_resources=True,
+        page_action=scroll_results_panel,
+        google_search=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@app.get("/api/health")
+async def health() -> dict[str, str]:
+    return {"status": "ok", "service": "claimory-scraper"}
 
 
 @app.get("/api/scrape")
 async def scrape_shops(
     zip_code: str = Query(..., description="US ZIP code to search"),
-    debug: bool = Query(False, description="Return raw page info for diagnostics"),
+    debug: bool = Query(False, description="Return raw card data for diagnostics"),
+    nocache: bool = Query(False, description="Bypass the in-memory cache"),
 ):
+    if not nocache and not debug:
+        cached = _cache_get(zip_code)
+        if cached is not None:
+            return JSONResponse({
+                "zip_code": zip_code,
+                "count": len(cached),
+                "shops": cached[:15],
+                "cached": True,
+            })
+
+    started = time.time()
+    url = f"https://www.google.com/maps/search/collision+repair+shop+near+{zip_code}"
+
     try:
-        from scrapling.fetchers import StealthyFetcher
-
-        url = f"https://www.google.com/maps/search/collision+repair+shop+near+{zip_code}"
-
-        page = await StealthyFetcher.async_fetch(
-            url,
-            headless=True,
-            network_idle=True,
-            timeout=45000,
-        )
-
-        if debug:
-            cards = page.css('div[class*="Nv2PK"]') or page.css('a[href*="/maps/place/"]')
-            sample = []
-            for i, card in enumerate(cards[:5]):
-                anchor_list = card.css('a[href*="/maps/place/"]') if hasattr(card, "css") else []
-                aria = anchor_list[0].attrib.get("aria-label", "") if anchor_list else ""
-                joined = ""
-                if hasattr(card, "css"):
-                    parts = []
-                    for child in card.css("span") + card.css("div"):
-                        t = (child.text or "").strip()
-                        if t:
-                            parts.append(t)
-                    joined = " ".join(parts)[:600]
-                sample.append({"i": i, "aria_label": aria, "joined_text": joined})
-            return JSONResponse({"zip_code": zip_code, "card_count": len(cards), "samples": sample})
-
-        shops = []
-        seen = set()
-        errors: list[str] = []
-
-        # Google Maps wraps each result in an `<a href="/maps/place/...">` link.
-        # The shop name lives in the link's aria-label; rating/reviews/address
-        # are in sibling elements within the same Nv2PK card.
-        # Strategy: find each Nv2PK card, then extract from anchor + text content.
-        cards = page.css('div[class*="Nv2PK"]') or page.css('a[href*="/maps/place/"]')
-
-        for card in cards[:30]:
-            try:
-                # Name from aria-label of the place anchor
-                anchor = card.css_first('a[href*="/maps/place/"]') if hasattr(card, "css_first") else None
-                if not anchor:
-                    anchor_list = card.css('a[href*="/maps/place/"]')
-                    anchor = anchor_list[0] if anchor_list else None
-                name = ""
-                if anchor is not None:
-                    name = (anchor.attrib.get("aria-label", "") or "").strip()
-                if not name:
-                    # Fall back: any heading text
-                    headings = card.css('div[class*="qBF1Pd"]') or card.css('div[class*="fontHeadlineSmall"]')
-                    if headings:
-                        name = (headings[0].text or "").strip()
-
-                if not name or len(name) < 3 or name in seen:
-                    continue
-
-                if not any(kw in name.lower() for kw in KEYWORDS):
-                    continue
-
-                seen.add(name)
-
-                # Build full visible text by joining every span/div text node.
-                text_parts: list[str] = []
-                if hasattr(card, "css"):
-                    for child in card.css("span") + card.css("div"):
-                        t = (child.text or "").strip()
-                        if t:
-                            text_parts.append(t)
-                card_text = " ".join(text_parts)
-
-                # Rating from the leading "<digit>.<digit>" in card text.
-                # Reviews are shown right after as either "4.8(323)" or "4.8 (323)".
-                # We must be careful: phone numbers contain "(323)" too — restrict to the
-                # parenthesized integer that immediately follows the rating.
-                rating, reviews = 0.0, 0
-                m = re.match(r"^\s*(\d\.\d)\s*\(([\d,]+)\)", card_text)
-                if m:
-                    try:
-                        rating = float(m.group(1))
-                        reviews = int(m.group(2).replace(",", ""))
-                    except ValueError:
-                        pass
-                else:
-                    # Bare rating without review-count parens.
-                    m = re.match(r"^\s*(\d\.\d)", card_text)
-                    if m:
-                        try:
-                            rating = float(m.group(1))
-                        except ValueError:
-                            pass
-
-                # Fallback: walk every aria-label looking for "X stars Y reviews" format.
-                if reviews == 0 and hasattr(card, "css"):
-                    for s in card.css("span") + card.css("button"):
-                        a = s.attrib.get("aria-label", "")
-                        rev_m = re.search(r"(\d\.\d)\s*stars?\s*([\d,]+)\s*review", a, re.IGNORECASE)
-                        if rev_m:
-                            try:
-                                if rating == 0.0:
-                                    rating = float(rev_m.group(1))
-                                reviews = int(rev_m.group(2).replace(",", ""))
-                            except ValueError:
-                                pass
-                            break
-
-                # Phone: only match a real US format with separator (skips area-code-only "(323)")
-                phone = ""
-                phone_match = re.search(r"\(\d{3}\)\s?\d{3}[-.\s]?\d{4}|\b\d{3}[-.\s]\d{3}[-.\s]\d{4}\b", card_text)
-                if phone_match:
-                    phone = phone_match.group(0).strip()
-
-                # Address: between the type ("Auto body shop · ·") and the hours ("Closed" / "Open").
-                # Format observed: "<rating> Auto body shop ·  · <ADDRESS> (Closed|Open) ..."
-                address = ""
-                addr_match = re.search(
-                    r"(?:body shop|collision (?:repair|center)|paint and body)\s*·\s*·?\s*(.+?)\s+(?:Closed|Open|Opens|Closes)",
-                    card_text,
-                    re.IGNORECASE,
-                )
-                if addr_match:
-                    address = addr_match.group(1).strip().lstrip("·").strip()
-
-                # State: try parsing from address; fallback to ZIP→state via known prefix table.
-                state = ""
-                state_match = re.search(r",\s*([A-Z]{2})\s*\d{5}", address or card_text)
-                if state_match:
-                    state = state_match.group(1)
-                else:
-                    state = _state_from_zip(zip_code)
-
-                # Website: look for any non-Google a[href] inside the card
-                website = ""
-                if hasattr(card, "css"):
-                    for link in card.css('a[href^="http"]'):
-                        href = link.attrib.get("href", "")
-                        if href and "google.com" not in href and "/maps/" not in href:
-                            website = href
-                            break
-
-                shop = {
-                    "name": name,
-                    "address": address,
-                    "zip_code": zip_code,
-                    "state": state,
-                    "rating": rating,
-                    "reviews": reviews,
-                    "phone": phone,
-                    "website": website,
-                }
-                shop["score"] = score_shop(shop)
-
-                # No threshold filter here — n8n's Score Lead step does the filtering.
-                # The scraper's job is to surface every collision-related shop it finds.
-                shops.append(shop)
-
-            except Exception as ex:
-                errors.append(f"{type(ex).__name__}: {ex}")
-                continue
-
-        shops.sort(key=lambda x: x["score"], reverse=True)
-        payload = {"zip_code": zip_code, "count": len(shops), "shops": shops[:15]}
-        if errors:
-            payload["parse_errors"] = errors[:5]
-        return JSONResponse(payload)
-
+        page = await fetch_maps_page(url)
     except ImportError:
         return JSONResponse(
             {"error": "scrapling not installed — run: pip install 'scrapling[fetchers]' && scrapling install"},
-            status_code=500
+            status_code=500,
         )
     except Exception as e:
-        return JSONResponse({"error": str(e), "zip_code": zip_code, "shops": []}, status_code=500)
+        return JSONResponse(
+            {"error": f"fetch failed: {type(e).__name__}: {e}", "zip_code": zip_code, "shops": []},
+            status_code=500,
+        )
 
+    cards = page.css('div[class*="Nv2PK"]') or page.css('a[href*="/maps/place/"]')
 
-@app.get("/api/health")
-async def health():
-    return {"status": "ok", "service": "claimory-scraper"}
+    if debug:
+        sample = []
+        for i, card in enumerate(cards[:8]):
+            anchor = card_first_anchor(card)
+            sample.append({
+                "i": i,
+                "aria_label": anchor.attrib.get("aria-label", "") if anchor else "",
+                "joined_text": card_full_text(card)[:300],
+            })
+        return JSONResponse({
+            "zip_code": zip_code,
+            "card_count": len(cards),
+            "elapsed_ms": int((time.time() - started) * 1000),
+            "samples": sample,
+        })
+
+    shops: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    parse_errors: list[str] = []
+    for card in cards[:60]:
+        try:
+            shop = parse_card(card, zip_code, seen)
+            if shop is not None:
+                shops.append(shop)
+        except Exception as ex:
+            parse_errors.append(f"{type(ex).__name__}: {ex}")
+
+    shops.sort(key=lambda x: x["score"], reverse=True)
+    if shops:
+        _cache_put(zip_code, shops)
+
+    payload: dict[str, Any] = {
+        "zip_code": zip_code,
+        "count": len(shops),
+        "shops": shops[:15],
+        "elapsed_ms": int((time.time() - started) * 1000),
+        "cached": False,
+    }
+    if parse_errors:
+        payload["parse_errors"] = parse_errors[:5]
+    return JSONResponse(payload)
