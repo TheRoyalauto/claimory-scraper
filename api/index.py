@@ -123,16 +123,18 @@ def _cache_put(zip_code: str, shops: list[dict[str, Any]]) -> None:
 # Pure parsing helpers
 # ---------------------------------------------------------------------------
 
-_ANCHOR_ARIA_RE = re.compile(
-    r"^\s*(?P<name>.+?)(?:,\s*(?P<rating>\d\.\d)\s*stars?\s*(?P<reviews>[\d,]+)\s*Reviews?)?(?:,\s*(?P<category>[^,]+))?\s*$",
+_LEADING_RATING_RE = re.compile(r"^\s*(\d\.\d)\b")
+_REVIEWS_ARIA_RE = re.compile(
+    r"(?:(\d\.\d)\s*stars?\s*)?([\d,]+)\s+review",
     re.IGNORECASE,
 )
 _PHONE_RE = re.compile(r"\(\d{3}\)\s?\d{3}[-.\s]?\d{4}|\b\d{3}[-.\s]\d{3}[-.\s]\d{4}\b")
 _ADDRESS_BETWEEN_RE = re.compile(
-    r"(?:body shop|collision (?:repair|center)|paint and body)\s*·\s*·?\s*(.+?)\s+(?:Closed|Open|Opens|Closes)",
+    r"(?:auto repair shop|auto body shop|body shop|collision (?:repair|center)|paint and body)\s*·?\s*·?\s*(.+?)\s+(?:Closed|Open|Opens|Closes)",
     re.IGNORECASE,
 )
 _STATE_FROM_ADDR_RE = re.compile(r",\s*([A-Z]{2})\s*\d{5}")
+_LEADING_DOT_RE = re.compile(r"^[·\s]+")
 
 
 def state_from_zip(zip_code: str) -> str:
@@ -141,28 +143,45 @@ def state_from_zip(zip_code: str) -> str:
     return _ZIP_PREFIX_STATE.get(zip_code[:3], "")
 
 
-def parse_anchor_aria(label: str) -> tuple[str, float, int]:
+def extract_rating_reviews(card, body: str) -> tuple[float, int]:
     """
-    Google encodes results as `"<Name>, <rating> stars <reviews> Reviews, <Category>"`.
-    Returns (name, rating, reviews). Missing fields default to ("", 0.0, 0).
+    Rating is the leading `<digit>.<digit>` in the card's visible text
+    (`4.8 Auto body shop · · 6016 S Central Ave …`). Reviews count is hidden:
+    Google renders it in an `aria-label` like `"4.8 stars 323 Reviews"` on
+    a star-icon span, OR `"123 reviews"` on a separate review-count span.
+    Walk every element with an `aria-label` until we find a match.
     """
-    m = _ANCHOR_ARIA_RE.match(label or "")
-    if not m:
-        return label.strip(), 0.0, 0
-    name = (m.group("name") or "").strip()
     rating = 0.0
+    m = _LEADING_RATING_RE.match(body)
+    if m:
+        try:
+            rating = float(m.group(1))
+        except ValueError:
+            pass
+
     reviews = 0
-    if m.group("rating"):
-        try:
-            rating = float(m.group("rating"))
-        except ValueError:
-            pass
-    if m.group("reviews"):
-        try:
-            reviews = int(m.group("reviews").replace(",", ""))
-        except ValueError:
-            pass
-    return name, rating, reviews
+    if hasattr(card, "css"):
+        candidates = (
+            card.css("[role='img'][aria-label]")
+            + card.css("span[aria-label]")
+            + card.css("button[aria-label]")
+            + card.css("a[aria-label]")
+        )
+        for el in candidates:
+            label = el.attrib.get("aria-label") or ""
+            if "review" not in label.lower():
+                continue
+            m2 = _REVIEWS_ARIA_RE.search(label)
+            if not m2:
+                continue
+            try:
+                if rating == 0.0 and m2.group(1):
+                    rating = float(m2.group(1))
+                reviews = int(m2.group(2).replace(",", ""))
+                break
+            except ValueError:
+                continue
+    return rating, reviews
 
 
 def card_full_text(card) -> str:
@@ -230,10 +249,14 @@ def score_shop(shop: dict[str, Any]) -> int:
 def parse_card(card, zip_code: str, seen: set[str]) -> dict[str, Any] | None:
     """Extract a structured shop record from one Google Maps card. None = skip."""
     anchor = card_first_anchor(card)
-    aria_label = ""
+    name = ""
     if anchor is not None:
-        aria_label = (anchor.attrib.get("aria-label") or "").strip()
-    name, rating, reviews = parse_anchor_aria(aria_label)
+        name = (anchor.attrib.get("aria-label") or "").strip()
+    if not name and hasattr(card, "css"):
+        # Fallback to a heading element if the anchor lacks an aria-label.
+        headings = card.css('div[class*="qBF1Pd"]') or card.css('div[class*="fontHeadlineSmall"]')
+        if headings:
+            name = (headings[0].text or "").strip()
 
     if not name or len(name) < 3 or name in seen:
         return None
@@ -242,6 +265,7 @@ def parse_card(card, zip_code: str, seen: set[str]) -> dict[str, Any] | None:
     seen.add(name)
 
     body = card_full_text(card)
+    rating, reviews = extract_rating_reviews(card, body)
 
     phone_m = _PHONE_RE.search(body)
     phone = phone_m.group(0).strip() if phone_m else ""
@@ -249,7 +273,7 @@ def parse_card(card, zip_code: str, seen: set[str]) -> dict[str, Any] | None:
     address = ""
     addr_m = _ADDRESS_BETWEEN_RE.search(body)
     if addr_m:
-        address = addr_m.group(1).strip().lstrip("·").strip()
+        address = _LEADING_DOT_RE.sub("", addr_m.group(1).strip())
 
     state_m = _STATE_FROM_ADDR_RE.search(address or body)
     state = state_m.group(1) if state_m else state_from_zip(zip_code)
