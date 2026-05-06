@@ -1,10 +1,15 @@
 """
 Claimory Scrapling lead-gen API.
 
-Scrapes Google Maps for collision-repair shops near a US ZIP code and returns
-structured shop records (name, address, state, rating, reviews, phone, website,
-score). Built on Scrapling's StealthyFetcher (Camoufox under the hood) to
-bypass Google's bot detection without paying for a third-party scraping API.
+Scrapes Google Maps for any business vertical near a US location (ZIP, city,
+or "City, ST") and returns structured records (name, address, state, rating,
+reviews, phone, website, score). Built on Scrapling's StealthyFetcher
+(Camoufox under the hood) to bypass Google's bot detection without paying for
+a third-party scraping API.
+
+Vertical-agnostic: pass `keyword` to scrape any business type — "collision
+repair shop", "dentist", "law firm", "restaurant", etc. Defaults to collision
+repair for backward compatibility with existing callers.
 
 Performance notes:
 - We avoid `network_idle=True` because Google Maps long-polls and never goes
@@ -14,8 +19,8 @@ Performance notes:
   drops from ~5MB to ~600KB and load time from ~8s to ~2s.
 - A `page_action` callback scrolls the results panel three times so we get
   30-60 cards instead of the initial 12.
-- Successful scrapes are cached in memory for 6 hours, keyed by ZIP. Repeat
-  calls inside the TTL return instantly. Cache clears on container restart.
+- Successful scrapes are cached in memory for 6 hours, keyed by
+  (keyword, location). Repeat calls inside the TTL return instantly.
 """
 
 import re
@@ -31,12 +36,7 @@ app = FastAPI()
 # Static data
 # ---------------------------------------------------------------------------
 
-PRIORITY_STATES = {"TX", "FL", "CA", "OH", "PA", "NY", "GA", "NC", "MI", "IL"}
-
-KEYWORDS = (
-    "collision repair", "collision shop", "body shop", "auto body",
-    "collision center", "paint and body",
-)
+DEFAULT_KEYWORD = "collision repair shop"
 
 # Coarse ZIP-prefix to state lookup (covers the workflow's seeded ZIPs).
 _ZIP_PREFIX_STATE = {
@@ -101,22 +101,27 @@ _ZIP_PREFIX_STATE = {
 # ---------------------------------------------------------------------------
 
 _CACHE_TTL_SECONDS = 6 * 3600
-_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+_cache: dict[tuple[str, str], tuple[float, list[dict[str, Any]]]] = {}
 
 
-def _cache_get(zip_code: str) -> list[dict[str, Any]] | None:
-    entry = _cache.get(zip_code)
+def _cache_key(keyword: str, location: str) -> tuple[str, str]:
+    return (keyword.strip().lower(), location.strip().lower())
+
+
+def _cache_get(keyword: str, location: str) -> list[dict[str, Any]] | None:
+    key = _cache_key(keyword, location)
+    entry = _cache.get(key)
     if not entry:
         return None
     inserted_at, shops = entry
     if (time.time() - inserted_at) > _CACHE_TTL_SECONDS:
-        _cache.pop(zip_code, None)
+        _cache.pop(key, None)
         return None
     return shops
 
 
-def _cache_put(zip_code: str, shops: list[dict[str, Any]]) -> None:
-    _cache[zip_code] = (time.time(), shops)
+def _cache_put(keyword: str, location: str, shops: list[dict[str, Any]]) -> None:
+    _cache[_cache_key(keyword, location)] = (time.time(), shops)
 
 
 # ---------------------------------------------------------------------------
@@ -129,8 +134,17 @@ _REVIEWS_ARIA_RE = re.compile(
     re.IGNORECASE,
 )
 _PHONE_RE = re.compile(r"\(\d{3}\)\s?\d{3}[-.\s]?\d{4}|\b\d{3}[-.\s]\d{3}[-.\s]\d{4}\b")
-_ADDRESS_BETWEEN_RE = re.compile(
-    r"(?:auto repair shop|auto body shop|body shop|collision (?:repair|center)|paint and body)[\s·•‧⋅·•‧]*(.+?)\s+(?:Closed|Open|Opens|Closes)",
+
+# Vertical-agnostic US street-address detector. Matches:
+#   <number> [N|S|E|W] <Street name words> <Suffix>[, Suite/Apt/Unit/#][, City][, ST ZIP]
+# Works for any business type — restaurants, dentists, law firms, body shops, etc.
+_STREET_SUFFIXES = (
+    r"(?:Ave|Avenue|St|Street|Rd|Road|Blvd|Boulevard|Dr|Drive|Ln|Lane|Way|"
+    r"Ct|Court|Pl|Place|Pkwy|Parkway|Cir|Circle|Hwy|Highway|Pike|Trail|Trl|"
+    r"Plaza|Plz|Sq|Square|Ter|Terrace|Loop|Mall|Crossing|Xing|Row|Walk)"
+)
+_ADDRESS_RE = re.compile(
+    rf"\b(\d{{1,6}}(?:-\d+)?\s+(?:[NSEW]\.?\s+)?[A-Z][\w'\.\-]+(?:\s+[\w'\.\-]+)*?\s+{_STREET_SUFFIXES}\.?(?:\s*,?\s*(?:Suite|Ste|Apt|Unit|Fl|Floor|#)\s*[\w\-]+)?(?:\s*,\s*[A-Z][\w\s\.\-]+?)?(?:\s*,\s*[A-Z]{{2}}\s*\d{{5}}(?:-\d{{4}})?)?)",
     re.IGNORECASE,
 )
 _STATE_FROM_ADDR_RE = re.compile(r",\s*([A-Z]{2})\s*\d{5}")
@@ -236,10 +250,14 @@ def card_external_website(card) -> str:
 
 
 def score_shop(shop: dict[str, Any]) -> int:
+    """
+    Vertical-agnostic 0-10 lead-quality score. No industry-specific bonuses
+    (priority states removed — was tuned for collision-shop ICP). Pure signal:
+    review volume, rating, and contactability.
+    """
     score = 0
     reviews = shop.get("reviews", 0) or 0
     rating = shop.get("rating", 0) or 0.0
-    state = shop.get("state", "")
     if reviews >= 100:
         score += 4
     elif reviews >= 50:
@@ -252,17 +270,19 @@ def score_shop(shop: dict[str, Any]) -> int:
         score += 2
     elif rating >= 4.0:
         score += 1
-    if state in PRIORITY_STATES:
-        score += 2
     if shop.get("website"):
-        score += 1
+        score += 2
     if shop.get("phone"):
-        score += 1
+        score += 2
     return min(score, 10)
 
 
-def parse_card(card, zip_code: str, seen: set[str]) -> dict[str, Any] | None:
-    """Extract a structured shop record from one Google Maps card. None = skip."""
+def parse_card(card, location: str, seen: set[str]) -> dict[str, Any] | None:
+    """
+    Extract a structured business record from one Google Maps card. None = skip.
+    Vertical-agnostic — no keyword filtering on the business name. Trusts
+    Google Maps' own relevance ranking for the search keyword.
+    """
     anchor = card_first_anchor(card)
     name = ""
     if anchor is not None:
@@ -275,8 +295,6 @@ def parse_card(card, zip_code: str, seen: set[str]) -> dict[str, Any] | None:
 
     if not name or len(name) < 3 or name in seen:
         return None
-    if not any(kw in name.lower() for kw in KEYWORDS):
-        return None
     seen.add(name)
 
     body = card_full_text(card)
@@ -286,23 +304,29 @@ def parse_card(card, zip_code: str, seen: set[str]) -> dict[str, Any] | None:
     phone = phone_m.group(0).strip() if phone_m else ""
 
     address = ""
-    addr_m = _ADDRESS_BETWEEN_RE.search(body)
+    addr_m = _ADDRESS_RE.search(body)
     if addr_m:
-        # Strip every Unicode dot-bullet variant + whitespace from both ends.
         raw = addr_m.group(1)
         raw = _LEADING_NOISE_RE.sub("", raw)
         raw = _TRAILING_NOISE_RE.sub("", raw)
-        address = raw
+        address = raw.strip()
 
+    # State: parse from address ", ST 12345" pattern, fall back to ZIP-prefix
+    # lookup if the location is a 5-digit ZIP.
     state_m = _STATE_FROM_ADDR_RE.search(address or body)
-    state = state_m.group(1) if state_m else state_from_zip(zip_code)
+    if state_m:
+        state = state_m.group(1)
+    elif location.isdigit() and len(location) == 5:
+        state = state_from_zip(location)
+    else:
+        state = ""
 
     website = card_external_website(card)
 
     shop = {
         "name": name,
         "address": address,
-        "zip_code": zip_code,
+        "zip_code": location if (location.isdigit() and len(location) == 5) else "",
         "state": state,
         "rating": rating,
         "reviews": reviews,
@@ -369,24 +393,59 @@ async def health() -> dict[str, str]:
     return {"status": "ok", "service": "claimory-scraper"}
 
 
+def _build_search_url(keyword: str, location: str) -> str:
+    """
+    Build a Google Maps search URL for any keyword + location combo.
+    Uses '+' encoding (matches what users type in maps.google.com directly).
+    """
+    parts = f"{keyword.strip()} near {location.strip()}".split()
+    return "https://www.google.com/maps/search/" + "+".join(parts)
+
+
 @app.get("/api/scrape")
 async def scrape_shops(
-    zip_code: str = Query(..., description="US ZIP code to search"),
+    zip_code: str = Query(
+        "",
+        description="US ZIP code, city name, or 'City, ST' string. Legacy "
+        "param name kept for backward compat — accepts any location string.",
+    ),
+    location: str = Query(
+        "",
+        description="Alias for zip_code. Use this for non-ZIP locations.",
+    ),
+    keyword: str = Query(
+        DEFAULT_KEYWORD,
+        description="Business type to search — 'dentist', 'restaurant', "
+        "'law firm', 'collision repair shop', etc. Defaults to "
+        f"'{DEFAULT_KEYWORD}' for backward compatibility.",
+    ),
+    limit: int = Query(15, ge=1, le=60, description="Max shops to return."),
     debug: bool = Query(False, description="Return raw card data for diagnostics"),
     nocache: bool = Query(False, description="Bypass the in-memory cache"),
 ):
+    loc = (location or zip_code or "").strip()
+    if not loc:
+        return JSONResponse(
+            {"error": "location required (pass ?zip_code= or ?location=)", "shops": []},
+            status_code=400,
+        )
+
+    kw = (keyword or DEFAULT_KEYWORD).strip()
+
     if not nocache and not debug:
-        cached = _cache_get(zip_code)
+        cached = _cache_get(kw, loc)
         if cached is not None:
             return JSONResponse({
-                "zip_code": zip_code,
+                "keyword": kw,
+                "location": loc,
+                "zip_code": loc if (loc.isdigit() and len(loc) == 5) else "",
                 "count": len(cached),
-                "shops": cached[:15],
+                "shops": cached[:limit],
                 "cached": True,
             })
 
     started = time.time()
-    url = f"https://www.google.com/maps/search/collision+repair+shop+near+{zip_code}"
+    url = _build_search_url(kw, loc)
 
     try:
         page = await fetch_maps_page(url)
@@ -397,7 +456,12 @@ async def scrape_shops(
         )
     except Exception as e:
         return JSONResponse(
-            {"error": f"fetch failed: {type(e).__name__}: {e}", "zip_code": zip_code, "shops": []},
+            {
+                "error": f"fetch failed: {type(e).__name__}: {e}",
+                "keyword": kw,
+                "location": loc,
+                "shops": [],
+            },
             status_code=500,
         )
 
@@ -417,7 +481,7 @@ async def scrape_shops(
                     except Exception:
                         pass
             body = card_full_text(card)
-            addr_m = _ADDRESS_BETWEEN_RE.search(body)
+            addr_m = _ADDRESS_RE.search(body)
             raw = addr_m.group(1) if addr_m else ""
             sample.append({
                 "i": i,
@@ -425,10 +489,11 @@ async def scrape_shops(
                 "joined_text": body[:300],
                 "all_aria_labels": labels[:15],
                 "raw_addr": raw,
-                "raw_addr_codepoints": [hex(ord(c)) for c in raw[:8]],
             })
         return JSONResponse({
-            "zip_code": zip_code,
+            "keyword": kw,
+            "location": loc,
+            "search_url": url,
             "card_count": len(cards),
             "elapsed_ms": int((time.time() - started) * 1000),
             "samples": sample,
@@ -437,7 +502,7 @@ async def scrape_shops(
     shops: list[dict[str, Any]] = []
     seen: set[str] = set()
     parse_errors: list[str] = []
-    rejected = {"no_name": 0, "dup_name": 0, "no_keyword": 0}
+    rejected = {"no_name": 0, "dup_name": 0}
     for idx, card in enumerate(cards[:60]):
         try:
             anchor = card_first_anchor(card)
@@ -448,10 +513,7 @@ async def scrape_shops(
             if name in seen:
                 rejected["dup_name"] += 1
                 continue
-            if not any(kw in name.lower() for kw in KEYWORDS):
-                rejected["no_keyword"] += 1
-                continue
-            shop = parse_card(card, zip_code, seen)
+            shop = parse_card(card, loc, seen)
             if shop is not None:
                 shops.append(shop)
         except Exception as ex:
@@ -459,12 +521,14 @@ async def scrape_shops(
 
     shops.sort(key=lambda x: x["score"], reverse=True)
     if shops:
-        _cache_put(zip_code, shops)
+        _cache_put(kw, loc, shops)
 
     payload: dict[str, Any] = {
-        "zip_code": zip_code,
+        "keyword": kw,
+        "location": loc,
+        "zip_code": loc if (loc.isdigit() and len(loc) == 5) else "",
         "count": len(shops),
-        "shops": shops[:15],
+        "shops": shops[:limit],
         "elapsed_ms": int((time.time() - started) * 1000),
         "cached": False,
     }
